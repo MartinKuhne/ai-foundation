@@ -1,0 +1,98 @@
+# syntax=docker/dockerfile:1
+# llama.cpp with ROCm 7.2.1 on Fedora 43, optimized for Strix Halo (gfx1151)
+
+FROM fedora:43 AS builder
+
+# ROCm and build configuration
+ENV ROCM_VERSION=7.2.1 \
+    AMDGPU_TARGETS=gfx1151 \
+    GPU_TARGETS=gfx1151
+
+# Install AMD ROCm 7.2.1 repo (using EL 10 — closest match for Fedora 43)
+RUN --mount=type=cache,target=/var/cache/dnf,sharing=locked \
+    dnf install -y \
+        "https://repo.radeon.com/amdgpu-install/7.2.1/el/10/amdgpu-install-7.2.1.70201-1.el10.noarch.rpm"
+
+# Install ROCm HIP SDK and build dependencies
+RUN --mount=type=cache,target=/var/cache/dnf,sharing=locked \
+    dnf install -y \
+        rocm-hip-sdk \
+        rocblas-devel \
+        hipblas-devel \
+        git \
+        cmake \
+        gcc \
+        gcc-c++ \
+        make \
+        ccache \
+        curl \
+        openssl-devel
+
+# ccache configuration
+ENV CCACHE_DIR=/ccache \
+    CMAKE_C_COMPILER_LAUNCHER=ccache \
+    CMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+# Clone llama.cpp
+WORKDIR /build
+RUN git clone --depth 1 https://github.com/ggml-org/llama.cpp.git
+
+# Configure (separate from build — cmake configure cache is preserved)
+WORKDIR /build/llama.cpp
+RUN --mount=type=cache,target=/ccache \
+    cmake -S . -B build \
+        -DGGML_HIP=ON \
+        -DGPU_TARGETS=gfx1151 \
+        -DAMDGPU_TARGETS=gfx1151 \
+        -DGGML_HIP_ROCWMMA_FATTN=ON \
+        -DLLAMA_OPENSSL=ON \
+        -DBUILD_SHARED_LIBS=ON \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/opt/llama \
+        -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+# Build and install (ccache dramatically speeds up rebuilds)
+RUN --mount=type=cache,target=/ccache \
+    cmake --build build --config Release -j "$(nproc)" && \
+    cmake --install build
+
+# --- Runtime stage ---
+FROM fedora:43
+
+ENV ROCM_VERSION=7.2.1
+
+RUN --mount=type=cache,target=/var/cache/dnf,sharing=locked \
+    dnf install -y \
+        "https://repo.radeon.com/amdgpu-install/7.2.1/el/10/amdgpu-install-7.2.1.70201-1.el10.noarch.rpm"
+
+RUN --mount=type=cache,target=/var/cache/dnf,sharing=locked \
+    dnf install -y \
+        rocm-hip-runtime \
+        rocblas \
+        hipblas \
+        openssl-libs
+
+# Copy installed binaries and shared libraries
+COPY --from=builder /opt/llama/ /usr/local/
+RUN ldconfig /usr/local/lib /usr/local/lib64
+
+# Strix Halo APU — unified memory, allow full system RAM for GPU
+ENV GGML_CUDA_ENABLE_UNIFIED_MEMORY=1 \
+    HSA_OVERRIDE_GFX_VERSION=11.5.1
+
+# Model selection (override with -e LLAMA_MODEL=org/repo)
+ENV LLAMA_MODEL=unsloth/gemma-4-E2B-it-GGUF:Q8_0
+
+EXPOSE 8080
+
+ENV LLAMA_ARGS="-ngl 99 -fa 1 -t 8 --no-mmap"
+
+EXPOSE 8080
+
+ENTRYPOINT ["/bin/sh", "-c", \
+    "exec llama-server \
+        -hf \"$LLAMA_MODEL\" \
+        --host 0.0.0.0 \
+        --port 8080 \
+        $LLAMA_ARGS"]
