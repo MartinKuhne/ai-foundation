@@ -1,0 +1,106 @@
+ARG ONEAPI_VERSION=latest
+
+ARG IGC_VERSION=v2.32.7
+ARG IGC_VERSION_FULL=2.32.7+21184
+ARG COMPUTE_RUNTIME_VERSION=26.14.37833.4
+ARG COMPUTE_RUNTIME_VERSION_FULL=26.14.37833.4-0
+ARG IGDGMM_VERSION=22.9.0
+
+FROM intel/deep-learning-essentials:${ONEAPI_VERSION} AS build
+
+ARG GGML_SYCL_F16=ON
+
+RUN apt-get update && \
+    apt-get install -y git libssl-dev
+
+WORKDIR /app
+
+RUN git clone --depth=1 --branch b8685 https://github.com/ggml-org/llama.cpp.git .
+
+RUN if [ "${GGML_SYCL_F16}" = "ON" ]; then \
+        export OPT_SYCL_F16="-DGGML_SYCL_F16=ON"; \
+    fi && \
+    cmake -B build -DGGML_NATIVE=OFF -DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DLLAMA_BUILD_TESTS=OFF ${OPT_SYCL_F16} && \
+    cmake --build build --config Release -j$(nproc)
+
+RUN mkdir -p /app/lib && \
+    find build -name "*.so*" -exec cp -P {} /app/lib \; && \
+    mkdir -p /app/bin && \
+    cp build/bin/llama-* /app/bin/
+
+FROM intel/deep-learning-essentials:${ONEAPI_VERSION} AS base
+
+ARG IGC_VERSION
+ARG IGC_VERSION_FULL
+ARG COMPUTE_RUNTIME_VERSION
+ARG COMPUTE_RUNTIME_VERSION_FULL
+ARG IGDGMM_VERSION
+
+RUN mkdir /tmp/neo/ && cd /tmp/neo/ \
+    && wget https://github.com/intel/intel-graphics-compiler/releases/download/$IGC_VERSION/intel-igc-core-2_${IGC_VERSION_FULL}_amd64.deb \
+    && wget https://github.com/intel/intel-graphics-compiler/releases/download/$IGC_VERSION/intel-igc-opencl-2_${IGC_VERSION_FULL}_amd64.deb \
+    && wget https://github.com/intel/compute-runtime/releases/download/$COMPUTE_RUNTIME_VERSION/intel-ocloc-dbgsym_${COMPUTE_RUNTIME_VERSION_FULL}_amd64.ddeb \
+    && wget https://github.com/intel/compute-runtime/releases/download/$COMPUTE_RUNTIME_VERSION/intel-ocloc_${COMPUTE_RUNTIME_VERSION_FULL}_amd64.deb \
+    && wget https://github.com/intel/compute-runtime/releases/download/$COMPUTE_RUNTIME_VERSION/intel-opencl-icd-dbgsym_${COMPUTE_RUNTIME_VERSION_FULL}_amd64.ddeb \
+    && wget https://github.com/intel/compute-runtime/releases/download/$COMPUTE_RUNTIME_VERSION/intel-opencl-icd_${COMPUTE_RUNTIME_VERSION_FULL}_amd64.deb \
+    && wget https://github.com/intel/compute-runtime/releases/download/$COMPUTE_RUNTIME_VERSION/libigdgmm12_${IGDGMM_VERSION}_amd64.deb \
+    && wget https://github.com/intel/compute-runtime/releases/download/$COMPUTE_RUNTIME_VERSION/libze-intel-gpu1-dbgsym_${COMPUTE_RUNTIME_VERSION_FULL}_amd64.ddeb \
+    && wget https://github.com/intel/compute-runtime/releases/download/$COMPUTE_RUNTIME_VERSION/libze-intel-gpu1_${COMPUTE_RUNTIME_VERSION_FULL}_amd64.deb \
+    && ls -la \
+    && dpkg --install *.deb \
+    && apt-get autoremove -y \
+    && apt-get clean -y \
+    && rm -rf /tmp/* /var/tmp/* \
+    && find /var/cache/apt/archives /var/lib/apt/lists -not -name lock -type f -delete \
+    && find /var/cache -type f -delete
+
+RUN apt-get update \
+    && apt-get install -y libgomp1 curl \
+    && apt autoremove -y \
+    && apt clean -y \
+    && rm -rf /tmp/* /var/tmp/* \
+    && find /var/cache/apt/archives /var/lib/apt/lists -not -name lock -type f -delete \
+    && find /var/cache -type f -delete
+
+FROM base AS server
+
+ENV LLAMA_ARG_HOST=0.0.0.0
+ENV LLAMA_ARG_PORT=8080
+
+COPY --from=build /app/lib/ /app/lib
+COPY --from=build /app/bin/llama-server /app/llama-server
+COPY --from=build /app/bin/llama-cli /app/llama-cli
+
+ENV PATH=/app:$PATH
+ENV LD_LIBRARY_PATH=/app/lib:/opt/intel/oneapi/compiler/latest/linux/lib/liboclc:/opt/intel/oneapi/compiler/latest/linux/lib/libigc:$LD_LIBRARY_PATH
+ENV SYCL_DEVICE_FILTER=gpu:0
+ENV GGML_BACKEND_PATH=/app/lib/libggml-sycl-x86_64.so
+
+WORKDIR /app
+
+EXPOSE 8080
+
+ENV LLAMA_MODEL=
+ENV LLAMA_ARGS=
+ENV LLAMA_ARG_HOST=0.0.0.0
+ENV LLAMA_ARG_PORT=8080
+
+ENV SYCL_DEVICE_FILTER=level_zero:gpu
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+ENTRYPOINT ["/bin/bash", "-c", \
+    "source /opt/intel/oneapi/setvars.sh > /dev/null 2>&1; \
+    if [ -z \"$LLAMA_MODEL\" ]; then \
+        echo \"ERROR: LLAMA_MODEL environment variable must be set\" >&2; \
+        echo \"Usage: docker run -e LLAMA_MODEL=/path/to/model ...\" >&2; \
+        exit 1; \
+    fi; \
+    echo \"INFO: Loading model: $LLAMA_MODEL\" >&2; \
+    exec llama-server \
+        -hf \"$LLAMA_MODEL\" \
+        --host 0.0.0.0 \
+        --port 8080 \
+        $LLAMA_ARGS"]
+

@@ -1,0 +1,63 @@
+ARG UBUNTU_VERSION=26.04
+
+FROM ubuntu:$UBUNTU_VERSION AS build
+
+RUN apt update && apt install -y git build-essential cmake wget xz-utils
+
+RUN apt install -y libssl-dev curl \
+    libxcb-xinput0 libxcb-xinerama0 libxcb-cursor-dev libvulkan-dev glslc spirv-headers
+
+WORKDIR /app
+
+RUN git clone --depth=1 https://github.com/ggml-org/llama.cpp.git .
+
+RUN cmake -B build -DGGML_NATIVE=OFF -DGGML_VULKAN=ON -DLLAMA_BUILD_TESTS=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON && \
+    cmake --build build --config Release -j$(nproc)
+
+RUN mkdir -p /app/lib && \
+    find build -name "*.so*" -exec cp -P {} /app/lib \;
+
+RUN mkdir -p /app/full \
+    && cp build/bin/* /app/full
+
+FROM ubuntu:$UBUNTU_VERSION AS base
+
+RUN apt-get update \
+    && apt-get install -y libgomp1 curl libvulkan1 mesa-vulkan-drivers \
+    libglvnd0 libgl1 libglx0 libegl1 libgles2 \
+    && apt autoremove -y \
+    && apt clean -y \
+    && rm -rf /tmp/* /var/tmp/* \
+    && find /var/cache/apt/archives /var/lib/apt/lists -not -name lock -type f -delete \
+    && find /var/cache -type f -delete
+
+COPY --from=build /app/lib/ /app
+
+FROM base AS server
+
+ENV LLAMA_ARG_HOST=0.0.0.0
+ENV LLAMA_ARG_PORT=8080
+ENV LLAMA_MODEL=
+ENV LLAMA_ARGS=
+
+COPY --from=build /app/full/llama-server /app
+
+WORKDIR /app
+
+EXPOSE 8080
+
+HEALTHCHECK CMD [ "curl", "-f", "http://localhost:8080/health" ]
+
+ENTRYPOINT ["/bin/bash", "-c", \
+    "if [ -z \"$LLAMA_MODEL\" ]; then \
+        echo \"ERROR: LLAMA_MODEL environment variable must be set\" >&2; \
+        echo \"Usage: docker run -e LLAMA_MODEL=/path/to/model.gguf ...\" >&2; \
+        exit 1; \
+    fi; \
+    echo \"INFO: Loading model: $LLAMA_MODEL\" >&2; \
+    echo \"INFO: Additional arguments: $LLAMA_ARGS\" >&2; \
+    exec /app/llama-server \
+        -hf \"$LLAMA_MODEL\" \
+        --host 0.0.0.0 \
+        --port 8080 \
+        $LLAMA_ARGS"]
