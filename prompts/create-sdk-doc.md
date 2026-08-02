@@ -18,7 +18,7 @@ You must strictly apply RFC 2119 keywords to define developer expectations. Keyw
 
 ### 2. ASD-STE100 (Simplified Technical English) Writing Rules
 You should apply the core principles of ASD-STE100 to maximize clarity and readability:
-- **Sentence Length**: Keep sentences under 20 words for instructions/procedural steps and under 25 words for descriptive text.
+- **Sentence Length**: Keep sentences under 30 words for instructions/procedural steps and under 45 words for descriptive text.
 - **Voice**: Use active voice. Imperative mood for steps (e.g., "Pass the token in the header," not "The token should be passed").
 - **Directness**: Avoid passive phrases, indirect language, or complex noun clusters.
 - **One Meaning Per Word**: Use precise, approved words. Do not use synonyms interchangeably (e.g., choose either "method" or "function" and stick to it).
